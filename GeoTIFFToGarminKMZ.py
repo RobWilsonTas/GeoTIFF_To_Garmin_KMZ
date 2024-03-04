@@ -10,12 +10,12 @@ startTime = time.time()
 User variable assignment
 """
 
-inImage         = 'C:\\Temp\\Test10.tif'    #The input image, e.g 'C:\\Temp\\Test.tif', this must be an 8 bit 4 band tif
-order           = 50                        #KML draw order (of the highest resolution layer)
-border          = 5                         #Size of crop border in pixels, you can refer to the outputs for looking for a white border
-tile_size       = 950                       #Tile size of the jpg tiles. Max is 1000?
-quality         = 90                        #JPEG quality (1-100)
-verbose         = False                     #Verbose logging
+inImage         = 'C:\\Temp\\YourImage.tif'    #The input image, e.g 'C:\\Temp\\Test.tif', this must be an 8 bit 4 band tif
+order           = 50                                #KML draw order (of the highest resolution layer)
+border          = 0                                 #Size of crop border in pixels, you can refer to the outputs for looking for a white border
+tile_size       = 950                               #Tile size of the jpg tiles. Max is 1000?
+quality         = 90                                #JPEG quality (10-100)
+verbose         = False                             #Verbose logging
 compressOptions = 'COMPRESS=ZSTD|PREDICTOR=1|NUM_THREADS=ALL_CPUS|BIGTIFF=IF_NEEDED|TILED=YES|ZSTD_LEVEL=1'
 
 
@@ -177,8 +177,9 @@ img = gdal.Open(firstLayerPath)
 img_size = [img.RasterXSize, img.RasterYSize]
 
 currentLayerNumber = 0
+timeToLeave = False
 #Start up a while loop where it continues to tile to a lower resolution until the tile size exceeds the current image size
-while img.RasterXSize > tile_size and img.RasterYSize > tile_size: 
+while not timeToLeave: 
     
     #This is used for naming the files based on what layer we're up to
     currentLayerNumber = currentLayerNumber + 1
@@ -193,6 +194,23 @@ while img.RasterXSize > tile_size and img.RasterYSize > tile_size:
     img = gdal.Open(currentLayerPath)
     img_size = [img.RasterXSize, img.RasterYSize]
     if verbose: logging.debug('Image size: %s' % img_size)
+    
+    #Get the current pixel size
+    gt = img.GetGeoTransform()
+    pixelSizeX = gt[1]
+    pixelSizeY = -gt[5]
+    
+    if img.RasterXSize < tile_size * 2 or img.RasterYSize < tile_size * 2: 
+        currentMinLod = -1
+        timeToLeave = True
+    else:
+        currentMinLod = 50/((pixelSizeX+pixelSizeY)/2)
+    
+    if currentLayerNumber == 1:
+        currentMaxLod = -1
+    else:
+        currentMaxLod = 100/((pixelSizeX+pixelSizeY)/2)
+
 
     #You could adjust this if you wanted to do something fancy
     base = currentLayerName
@@ -241,17 +259,22 @@ while img.RasterXSize > tile_size and img.RasterYSize > tile_size:
                 <west>%(west)s</west>
                 <rotation>0</rotation>
     """ % bounds)
+    
             bob.write("""        </LatLonBox>
-            </GroundOverlay>
+            <Region>
+            <Lod>
+            <minLodPixels>%s</minLodPixels>
+            <maxLodPixels>%s</maxLodPixels>
+            <minFadeExtent>0</minFadeExtent>
+            <maxFadeExtent>0</maxFadeExtent>
+            </Lod>
+            </Region>
+    """ % (currentMinLod,currentMaxLod))
+            bob.write("""</GroundOverlay>
     """);
         
-
-    #Ok so now we'll get the current pixel size...
-    gt = img.GetGeoTransform()
-    pixelSizeX = gt[1]
-    pixelSizeY = -gt[5]    
         
-    #to reduce the image to a lower resolution for the next layer
+    #Reduce the image to a lower resolution for the next layer
     processing.run("gdal:warpreproject", {'INPUT':currentLayerPath,
     'SOURCE_CRS':None,'TARGET_CRS':None,'RESAMPLING':0,'NODATA':255,
     'TARGET_RESOLUTION':None,'OPTIONS':compressOptions,'DATA_TYPE':0,'TARGET_EXTENT':None,'TARGET_EXTENT_CRS':None,'MULTITHREADING':True,
@@ -327,6 +350,7 @@ shutil.copy(destinationKmzPath, directory)
 
 #Final messages
 if verbose: logging.info("Finished")
+print("All done")
 endTime = time.time()
 totalTime = endTime - startTime
 box = QMessageBox()
