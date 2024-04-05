@@ -1,22 +1,26 @@
-import os, math, re, sys, subprocess, logging, shutil, time, numpy
+import os, math, re, sys, subprocess, logging, shutil, time, numpy, osr, ogr
 from optparse import OptionParser
 from osgeo import gdal        
 import os.path
 from pathlib import Path
 startTime = time.time()
 
+
 """
 ##########################################################################
 User variable assignment
 """
 
-inImage         = 'C:\\Temp\\YourImage.tif'    #The input image, e.g 'C:\\Temp\\Test.tif', this must be an 8 bit 4 band tif
-order           = 50                                #KML draw order (of the highest resolution layer)
-border          = 0                                 #Size of crop border in pixels, you can refer to the outputs for looking for a white border
-tile_size       = 950                               #Tile size of the jpg tiles. Max is 1000?
-quality         = 90                                #JPEG quality (10-100)
-verbose         = False                             #Verbose logging
+inImage         = 'C:\\Temp\\YourImage.tif'            #The input image, e.g 'C:\\Temp\\Test.tif', this must be an 8 bit 4 band tif
+order           = 50                                   #KML draw order (of the highest resolution layer), likely not relevant for much...
+border          = 0                                    #Size of crop border in pixels, you can refer to the outputs for looking for a white border. This is not relevant if the image is already in WGS 84.
+tile_size       = 1000                                 #Tile size of the jpg tiles. Max is 1024?
+quality         = 92                                   #JPEG quality (10-100)
+verbose         = False                                #Verbose logging
 compressOptions = 'COMPRESS=ZSTD|PREDICTOR=1|NUM_THREADS=ALL_CPUS|BIGTIFF=IF_NEEDED|TILED=YES|ZSTD_LEVEL=1'
+
+useTileSelector = True                                 #To limit excess tiles you can use a polygon to select only the relevant areas to produce tiles for
+tileSelector    = 'C:/Temp/YourRelevantArea.gpkg'      #A polygon to select the area where tiles will be created, e.g 'C:/Temp/RelevantArea.gpkg'
 
 
 """
@@ -39,11 +43,9 @@ if not os.path.exists(inImage):
     fixItUpBro
 if not os.path.exists(processDirectory): os.mkdir(processDirectory)
 
-
 #Set up names for variables
 destinationKmlPath  = processDirectory + originalName + '.kml'
-upResName           = originalName + '_HigherRes' 
-wgsName             = upResName + '_ReProjected'
+wgsName             = originalName + '_ReProjected'
 firstLayerName      = originalName + '_Layer'
 
 #Get the pixel size of the input raster for bumping up the res
@@ -51,7 +53,8 @@ img = gdal.Open(inImage)
 gt = img.GetGeoTransform()
 pixelSizeX = gt[1]
 pixelSizeY = -gt[5]
-
+prj=img.GetProjection()
+srs=osr.SpatialReference(wkt=prj)
 
 #If the image is smaller than the tiles then it doesn't make sense to tile
 if img.RasterXSize - border < tile_size or img.RasterYSize - border < tile_size:
@@ -59,52 +62,67 @@ if img.RasterXSize - border < tile_size or img.RasterYSize - border < tile_size:
     fixItUpBro
 
 
+if useTileSelector:
+    try:
+        #Bring in the tile selector as geometry
+        processing.run("native:reprojectlayer", {'INPUT':tileSelector,'TARGET_CRS':QgsCoordinateReferenceSystem('EPSG:4326'),
+        'OPERATION':'+proj=pipeline +step +inv +proj=utm +zone=55 +south +ellps=GRS80 +step +proj=unitconvert +xy_in=rad +xy_out=deg',
+        'OUTPUT':processDirectory + 'SelectorProjected.gpkg'})
+    except:
+        print("The tile selector probably already exists?")
+    
+    #Convert the polygon to a feature variable for later comparison
+    selectorVector = QgsVectorLayer(processDirectory + 'SelectorProjected.gpkg')
+    listOfFids = selectorVector.aggregate(QgsAggregateCalculator.ArrayAggregate, 'fid')[0]
+    print('Selector polygon is ' + str(int((os.path.getsize(processDirectory + 'SelectorProjected.gpkg')/1000))) + 'KB')
+
+
 """
 ##########################################################################
 Prepping of image for the tiling part
 """
 
-#Bump up resolution before the reproject
-processing.run("gdal:warpreproject", {'INPUT':inImage,
-'SOURCE_CRS':None,'TARGET_CRS':None,'RESAMPLING':0,'NODATA':255,
-'TARGET_RESOLUTION':None,'OPTIONS':compressOptions,'DATA_TYPE':0,'TARGET_EXTENT':None,'TARGET_EXTENT_CRS':None,'MULTITHREADING':True,
-'EXTRA':'-r cubic -tr ' + str(pixelSizeX / 1.5) + ' ' + str(pixelSizeY / 1.5),
-'OUTPUT':processDirectory + upResName + '.tif'})
-
-#We need to reproject into WGS84
-processing.run("gdal:warpreproject", {'INPUT':processDirectory + upResName + '.tif',
-'SOURCE_CRS':None,'TARGET_CRS':QgsCoordinateReferenceSystem('EPSG:4326'),'RESAMPLING':0,'NODATA':255,
-'TARGET_RESOLUTION':None,'OPTIONS':compressOptions,'DATA_TYPE':0,'TARGET_EXTENT':None,'TARGET_EXTENT_CRS':None,'MULTITHREADING':True,
-'EXTRA':'-srcnodata 255 -dstnodata 255 -nosrcalpha -r nearest',
-'OUTPUT':processDirectory + wgsName + '.tif'})
-
-imageForAlphaRemoval = processDirectory + wgsName + '.tif'
-
-#If the border value is set then we need to crop the transformed image
-if border > 0 :
-    #First get the crop boundary
-    img = gdal.Open(processDirectory + wgsName + '.tif')
-    gt = img.GetGeoTransform()
-    pixelSizeX = gt[1]
-    pixelSizeY = -gt[5]
-    minx = gt[0]
-    maxy = gt[3]
-    maxx = (minx + gt[1] * img.RasterXSize) - (pixelSizeX * border)
-    miny = (maxy + gt[5] * img.RasterYSize) + (pixelSizeX * border)
-    minx = minx + (pixelSizeX * border)
-    maxy = maxy - (pixelSizeY * border)
-    cropParameter = str(minx) + ' ' + str(miny) + ' ' + str(maxx) + ' ' + str(maxy)
-    print ('Crop dimensions are ' + cropParameter)  
+#The kmz requires the tiles to be in WGS 84 (EPSG 4326)
+if srs.GetAttrValue('AUTHORITY',1) != '4326':
     
-    #Then use the crop boundary to clip the raster
-    processing.run("gdal:warpreproject", {'INPUT':processDirectory + wgsName + '.tif',
-    'SOURCE_CRS':None,'TARGET_CRS':None,'RESAMPLING':0,'NODATA':255,
+    print("The image needs to be reprojected into WGS 84")
+    #We need to reproject into WGS84
+    processing.run("gdal:warpreproject", {'INPUT':inImage,
+    'SOURCE_CRS':None,'TARGET_CRS':QgsCoordinateReferenceSystem('EPSG:4326'),'RESAMPLING':0,'NODATA':255,
     'TARGET_RESOLUTION':None,'OPTIONS':compressOptions,'DATA_TYPE':0,'TARGET_EXTENT':None,'TARGET_EXTENT_CRS':None,'MULTITHREADING':True,
-    'EXTRA':'-srcnodata 255 -dstnodata 255 -nosrcalpha -r nearest -overwrite -te ' + cropParameter,
-    'OUTPUT':processDirectory + wgsName + '_Cropped.tif'})
-    
-    imageForAlphaRemoval = processDirectory + wgsName + '_Cropped.tif'
+    'EXTRA':'-srcnodata 255 -dstnodata 255 -nosrcalpha -r cubic',
+    'OUTPUT':processDirectory + wgsName + '.tif'})
 
+    imageForAlphaRemoval = processDirectory + wgsName + '.tif'
+
+    #If the border value is set then we need to crop the transformed image
+    if border > 0 :
+        #First get the crop boundary
+        img = gdal.Open(processDirectory + wgsName + '.tif')
+        gt = img.GetGeoTransform()
+        pixelSizeX = gt[1]
+        pixelSizeY = -gt[5]
+        minx = gt[0]
+        maxy = gt[3]
+        maxx = (minx + gt[1] * img.RasterXSize) - (pixelSizeX * border)
+        miny = (maxy + gt[5] * img.RasterYSize) + (pixelSizeX * border)
+        minx = minx + (pixelSizeX * border)
+        maxy = maxy - (pixelSizeY * border)
+        cropParameter = str(minx) + ' ' + str(miny) + ' ' + str(maxx) + ' ' + str(maxy)
+        print ('Crop dimensions are ' + cropParameter)  
+        
+        #Then use the crop boundary to clip the raster
+        processing.run("gdal:warpreproject", {'INPUT':processDirectory + wgsName + '.tif',
+        'SOURCE_CRS':None,'TARGET_CRS':None,'RESAMPLING':0,'NODATA':255,
+        'TARGET_RESOLUTION':None,'OPTIONS':compressOptions,'DATA_TYPE':0,'TARGET_EXTENT':None,'TARGET_EXTENT_CRS':None,'MULTITHREADING':True,
+        'EXTRA':'-srcnodata 255 -dstnodata 255 -nosrcalpha -r nearest -overwrite -te ' + cropParameter,
+        'OUTPUT':processDirectory + wgsName + '_Cropped.tif'})
+        
+        imageForAlphaRemoval = processDirectory + wgsName + '_Cropped.tif'
+
+else:
+    imageForAlphaRemoval = inImage
+    print("The image appears to already be in WGS 84")
 
 #Remove the alpha band
 processing.run("gdal:translate", {'INPUT':imageForAlphaRemoval,'TARGET_CRS':QgsCoordinateReferenceSystem('EPSG:4326'),'NODATA':None,
@@ -176,8 +194,14 @@ bob.write("""<?xml version="1.0" encoding="UTF-8"?>
 img = gdal.Open(firstLayerPath)
 img_size = [img.RasterXSize, img.RasterYSize]
 
+
+#Variables used in the while loop
 currentLayerNumber = 0
+currentTileNumber = 0
+numberOfRejectedTiles = 0
 timeToLeave = False
+
+
 #Start up a while loop where it continues to tile to a lower resolution until the tile size exceeds the current image size
 while not timeToLeave: 
     
@@ -200,12 +224,14 @@ while not timeToLeave:
     pixelSizeX = gt[1]
     pixelSizeY = -gt[5]
     
+    #Once the tile size is too big compared with the original image then the pyramid has reached its limit
     if img.RasterXSize < tile_size * 2 or img.RasterYSize < tile_size * 2: 
         currentMinLod = -1
         timeToLeave = True
     else:
         currentMinLod = 50/((pixelSizeX+pixelSizeY)/2)
     
+    #Ensure that the lod numbers allowing viewing close up
     if currentLayerNumber == 1:
         currentMaxLod = -1
     else:
@@ -220,6 +246,12 @@ while not timeToLeave:
     tileAmountX = math.ceil((img_size[0]/tile_size)-0.00001)
     tileAmountY = math.ceil((img_size[1]/tile_size)-0.00001)
 
+
+    """
+    ##########################################################################
+    The for-loops that go through
+    """
+    
     #Two for-loops that run through the grid of tiles
     for t_y in range(tileAmountY):
         for t_x in range(tileAmountX):
@@ -231,6 +263,7 @@ while not timeToLeave:
             src_corner = (t_x * tile_size, t_y * tile_size)                
             src_size = [tile_size, tile_size]
             
+            
             #If it is the case that the tile will extend beyond the full image, then scale the tile down until it does fit
             while src_corner[0] + src_size[0] > img_size[0]: 
                 src_size[0] = src_size[0] -1
@@ -241,44 +274,70 @@ while not timeToLeave:
             outfile = "%s_%d_%d.jpg" % (base, t_x, t_y)
             bounds = create_tile(img, "%s/%s" % (processDirectory, outfile), src_corner, src_size, quality)
             
-            #Write to the .kml
-            bob.write("""    <GroundOverlay>
-            <name>%s</name>
-            <color>ffffffff</color>
-            <drawOrder>%d</drawOrder>
-            <Icon>
-                <href>%s/%s</href>
-                <viewBoundScale>0.75</viewBoundScale>
-            </Icon>
-            <LatLonBox>
-    """ % (outfile, order, path, outfile))
+            
+            #Check to see if the tile is within the relevant area
+            if useTileSelector:
+                selectTheTile = False
+            
+                boundsGeom = QgsGeometry.fromWkt('POLYGON((' + str(bounds['west']) + ' ' + str(bounds['north']) + ', ' + str(bounds['west']) + ' ' + str(bounds['south']) + ', ' + str(bounds['east']) + ' ' + str(bounds['south']) + ', ' + str(bounds['east']) + ' ' + str(bounds['north']) + ', ' + str(bounds['west']) + ' ' + str(bounds['north']) + '))')
+                for fid in listOfFids:
+                    if (boundsGeom.overlaps(selectorVector.getGeometry(fid))):
+                        selectTheTile = True
+                    elif (boundsGeom.within(selectorVector.getGeometry(fid))):
+                        selectTheTile = True
+                    elif (selectorVector.getGeometry(fid).within(boundsGeom)):
+                        selectTheTile = True
+            else:
+                selectTheTile = True
+
+            
+            if selectTheTile:
+                
+                #A fenix 7 won't allow more than 500 tiles
+                currentTileNumber = currentTileNumber + 1
+                if currentTileNumber == 501:
+                    print("Your garmin device may not support greater than 500 tiles...")
+            
+                #Write to the .kml
+                bob.write("""    <GroundOverlay>
+                <name>%s</name>
+                <color>ffffffff</color>
+                <drawOrder>%d</drawOrder>
+                <Icon>
+                    <href>%s/%s</href>
+                    <viewBoundScale>0.75</viewBoundScale>
+                </Icon>
+                <LatLonBox>
+        """ % (outfile, order, path, outfile))
+            
+                bob.write("""        <north>%(north)s</north>
+                    <south>%(south)s</south>
+                    <east>%(east)s</east>
+                    <west>%(west)s</west>
+                    <rotation>0</rotation>
+        """ % bounds)
         
-            bob.write("""        <north>%(north)s</north>
-                <south>%(south)s</south>
-                <east>%(east)s</east>
-                <west>%(west)s</west>
-                <rotation>0</rotation>
-    """ % bounds)
+                bob.write("""        </LatLonBox>
+                <Region>
+                <Lod>
+                <minLodPixels>%s</minLodPixels>
+                <maxLodPixels>%s</maxLodPixels>
+                <minFadeExtent>0</minFadeExtent>
+                <maxFadeExtent>0</maxFadeExtent>
+                </Lod>
+                </Region>
+        """ % (currentMinLod,currentMaxLod))
+                bob.write("""</GroundOverlay>
+        """);
+            
+            else:
+                numberOfRejectedTiles = numberOfRejectedTiles + 1
     
-            bob.write("""        </LatLonBox>
-            <Region>
-            <Lod>
-            <minLodPixels>%s</minLodPixels>
-            <maxLodPixels>%s</maxLodPixels>
-            <minFadeExtent>0</minFadeExtent>
-            <maxFadeExtent>0</maxFadeExtent>
-            </Lod>
-            </Region>
-    """ % (currentMinLod,currentMaxLod))
-            bob.write("""</GroundOverlay>
-    """);
-        
-        
     #Reduce the image to a lower resolution for the next layer
     processing.run("gdal:warpreproject", {'INPUT':currentLayerPath,
     'SOURCE_CRS':None,'TARGET_CRS':None,'RESAMPLING':0,'NODATA':255,
     'TARGET_RESOLUTION':None,'OPTIONS':compressOptions,'DATA_TYPE':0,'TARGET_EXTENT':None,'TARGET_EXTENT_CRS':None,'MULTITHREADING':True,
-    'EXTRA':'-r cubic -tr ' + str(pixelSizeX*2) + ' ' + str(pixelSizeY*2),
+    'EXTRA':'-r cubic -tr ' + str(pixelSizeX*4) + ' ' + str(pixelSizeY*4),
     'OUTPUT':nextLayerPath})
     
     #Now reduce the 'order' by one, and use the next image to see whether to continue the while loop
@@ -348,6 +407,7 @@ zip.writestr('doc.kml', kml.toxml("UTF-8"));
 zip.close()
 shutil.copy(destinationKmzPath, directory)
 
+
 #Final messages
 if verbose: logging.info("Finished")
 print("All done")
@@ -356,7 +416,7 @@ totalTime = endTime - startTime
 box = QMessageBox()
 box.setIcon(QMessageBox.Question)
 box.setWindowTitle("Yeah we're done here")
-box.setText("Yeah all done\n\nThis took " + str(int(totalTime)) + " seconds\n\nHave a look at " + directory + originalName + '.kmz')
+box.setText("Yeah all done\n\nThis took " + str(int(totalTime)) + " seconds\n\nThere were " + str(currentTileNumber) + " tiles created and " + str(numberOfRejectedTiles) + " rejected\n\nHave a look at " + directory + originalName + '.kmz')
 box.setStandardButtons(QMessageBox.Yes)
 buttonY = box.button(QMessageBox.Yes)
 buttonY.setText('Yeah nice')
