@@ -1,6 +1,6 @@
-import os, math, re, sys, subprocess, logging, shutil, time, numpy, osr, ogr
+import os, math, re, sys, subprocess, logging, shutil, time, numpy
 from optparse import OptionParser
-from osgeo import gdal        
+from osgeo import gdal, osr, ogr
 import os.path
 from pathlib import Path
 startTime = time.time()
@@ -19,7 +19,7 @@ quality         = 92                                   #JPEG quality (10-100)
 verbose         = False                                #Verbose logging
 compressOptions = 'COMPRESS=ZSTD|PREDICTOR=1|NUM_THREADS=ALL_CPUS|BIGTIFF=IF_NEEDED|TILED=YES|ZSTD_LEVEL=1'
 
-useTileSelector = True                                 #To limit excess tiles you can use a polygon to select only the relevant areas to produce tiles for
+useTileSelector = False                                 #To limit excess tiles you can use a polygon to select only the relevant areas to produce tiles for
 tileSelector    = 'C:/Temp/YourRelevantArea.gpkg'      #A polygon to select the area where tiles will be created, e.g 'C:/Temp/RelevantArea.gpkg'
 
 
@@ -88,9 +88,9 @@ if srs.GetAttrValue('AUTHORITY',1) != '4326':
     print("The image needs to be reprojected into WGS 84")
     #We need to reproject into WGS84
     processing.run("gdal:warpreproject", {'INPUT':inImage,
-    'SOURCE_CRS':None,'TARGET_CRS':QgsCoordinateReferenceSystem('EPSG:4326'),'RESAMPLING':0,'NODATA':255,
+    'SOURCE_CRS':None,'TARGET_CRS':QgsCoordinateReferenceSystem('EPSG:4326'),'RESAMPLING':2,'NODATA':None,
     'TARGET_RESOLUTION':None,'OPTIONS':compressOptions,'DATA_TYPE':0,'TARGET_EXTENT':None,'TARGET_EXTENT_CRS':None,'MULTITHREADING':True,
-    'EXTRA':'-srcnodata 255 -dstnodata 255 -nosrcalpha -r cubic',
+    'EXTRA':'-srcnodata 255 -dstnodata 255 -nosrcalpha',
     'OUTPUT':processDirectory + wgsName + '.tif'})
 
     imageForAlphaRemoval = processDirectory + wgsName + '.tif'
@@ -335,9 +335,9 @@ while not timeToLeave:
     
     #Reduce the image to a lower resolution for the next layer
     processing.run("gdal:warpreproject", {'INPUT':currentLayerPath,
-    'SOURCE_CRS':None,'TARGET_CRS':None,'RESAMPLING':0,'NODATA':255,
+    'SOURCE_CRS':None,'TARGET_CRS':None,'RESAMPLING':2,'NODATA':255,
     'TARGET_RESOLUTION':None,'OPTIONS':compressOptions,'DATA_TYPE':0,'TARGET_EXTENT':None,'TARGET_EXTENT_CRS':None,'MULTITHREADING':True,
-    'EXTRA':'-r cubic -tr ' + str(pixelSizeX*4) + ' ' + str(pixelSizeY*4),
+    'EXTRA':'-tr ' + str(pixelSizeX*4) + ' ' + str(pixelSizeY*4),
     'OUTPUT':nextLayerPath})
     
     #Now reduce the 'order' by one, and use the next image to see whether to continue the while loop
